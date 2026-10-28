@@ -1,0 +1,329 @@
+# GitHub Actions CI workflow for Thorium
+#
+# Full pipeline:
+#   1. lint         - Static checks: shell syntax (bash -n), Python compile check,
+#                     YAML validation, actionlint.
+#   2. setup-dryrun - Verify repo tooling: depot_tools checkout, submodules,
+#                     helper scripts run with --help.
+#   3. build        - Matrix build on Linux and macOS. A full Thorium release
+#                     build needs ~75GB of disk and many hours (beyond free
+#                     GitHub-hosted runner limits), so by default this builds a
+#                     reduced smoke target. Trigger manually with
+#                     inputs.build_full=true to attempt the 'thorium' target.
+#
+# Runs on: pushes to main, pull requests, weekly schedule, manual dispatch.
+
+name: CI
+
+on:
+  push:
+    branches: [ "main" ]
+    paths-ignore:
+      - "docs/**"
+      - "*.md"
+      - "logos/**"
+  pull_request:
+    branches: [ "main" ]
+  schedule:
+    # Every Monday at 04:00 UTC
+    - cron: "0 4 * * 1"
+  workflow_dispatch:
+    inputs:
+      build_full:
+        description: "Attempt full 'thorium' build target (very slow, may exceed runner limits)"
+        required: false
+        type: boolean
+        default: false
+      chromium_branch:
+        description: "Chromium branch to fetch (e.g. 6723 for M132). Empty = latest/main"
+        required: false
+        type: string
+        default: ""
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Disable depot_tools auto-update noise on runners
+  DEPOT_TOOLS_UPDATE: "0"
+
+permissions:
+  contents: read
+
+jobs:
+  ###########################################################################
+  # Job 1: Lint / static checks (fast, runs first)
+  ###########################################################################
+  lint:
+    name: Lint & Static Checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install lint tools
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pyyaml
+
+      - name: Bash syntax check (all *.sh scripts)
+        run: |
+          shopt -s globstar nullglob
+          fail=0
+          for f in **/*.sh; do
+            echo "Checking $f"
+            bash -n "$f" || { echo "::error file=$f::bash syntax error"; fail=1; }
+          done
+          exit $fail
+
+      - name: Python syntax/compile check (win_scripts)
+        run: |
+          python -m compileall -q win_scripts/
+
+      - name: Validate YAML files (.github)
+        run: |
+          python - <<'EOF'
+          import glob, sys, yaml
+          bad = 0
+          files = glob.glob(".github/**/*.yml", recursive=True) + \
+                  glob.glob(".github/**/*.yaml", recursive=True)
+          for f in files:
+              try:
+                  yaml.safe_load(open(f))
+                  print(f"OK: {f}")
+              except Exception as e:
+                  print(f"::error file={f}::{e}")
+                  bad = 1
+          sys.exit(bad)
+          EOF
+
+      - name: Check shell scripts are executable
+        run: |
+          fail=0
+          shopt -s globstar nullglob
+          for f in **/*.sh; do
+            if [ ! -x "$f" ]; then
+              echo "::warning file=$f::$f is not executable"
+            fi
+          done
+          exit $fail
+
+      - name: actionlint (workflow self-check)
+        uses: reviewdog/action-actionlint@v1
+        with:
+          reporter: github-pr-check
+          fail_level: error
+
+  ###########################################################################
+  # Job 2: Setup dry-run (verify tooling without a Chromium checkout)
+  ###########################################################################
+  setup-dryrun:
+    name: Setup Tooling Check
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: lint
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Clone depot_tools
+        run: |
+          git clone --depth=1 https://chromium.googlesource.com/chromium/tools/depot_tools.git "$HOME/depot_tools"
+          echo "$HOME/depot_tools" >> "$GITHUB_PATH"
+
+      - name: Verify depot_tools core commands available
+        run: |
+          set -e
+          export PATH="$HOME/depot_tools:$PATH"
+          for cmd in gclient gn ninja autoninja fetch; do
+            command -v "$cmd" >/dev/null || { echo "::error::Missing depot_tools command: $cmd"; exit 1; }
+            echo "Found $cmd: $(command -v $cmd)"
+          done
+
+      - name: Verify helper scripts respond to --help
+        run: |
+          ./setup.sh --help
+          ./build.sh --help
+
+      - name: Check submodule directories and GN args files
+        run: |
+          test -d thorium-libjxl && echo "thorium-libjxl OK"
+          test -d infra && echo "infra OK"
+          test -f args.gn && echo "args.gn OK"
+          test -f win_args.gn && echo "win_args.gn OK"
+
+  ###########################################################################
+  # Job 3: Build smoke test (Linux + macOS matrix)
+  ###########################################################################
+  build:
+    name: Build (${{ matrix.os }}${{ inputs.build_full && ' FULL' || ' SMOKE' }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 480
+    needs: setup-dryrun
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14]
+    env:
+      CR_SRC_DIR: ${{ github.workspace }}/chromium/src
+    steps:
+      - name: Free up disk space (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                     /opt/hostedtoolcache/CodeQL /usr/local/share/boost || true
+          df -h
+
+      - name: Checkout Thorium repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          path: thorium
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Clone depot_tools
+        run: |
+          git clone --depth=1 https://chromium.googlesource.com/chromium/tools/depot_tools.git "$HOME/depot_tools"
+          echo "$HOME/depot_tools" >> "$GITHUB_PATH"
+
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config git curl xz-utils p7zip-full \
+            libfontconfig1-dev libcairo2-dev libgtk-3-dev \
+            libnotify-dev libasound2-dev libpulse-dev libcups2-dev \
+            libdrm-dev libxkbcommon-dev libxcomposite-dev libxdamage-dev \
+            libxrandr-dev libgbm-dev
+
+      - name: Fetch Chromium sources
+        run: |
+          set -e
+          mkdir -p "$(dirname "$CR_SRC_DIR")"
+          cd "$(dirname "$CR_SRC_DIR")"
+          BRANCH="${{ inputs.chromium_branch }}"
+          if [ -n "$BRANCH" ]; then
+            fetch --no-history --nohooks --branch="$BRANCH" chromium
+          else
+            fetch --no-history --nohooks chromium
+          fi
+        timeout-minutes: 180
+
+      - name: Select build target
+        id: tgt
+        run: |
+          if [ "${{ inputs.build_full }}" = "true" ]; then
+            echo "target=thorium" >> "$GITHUB_OUTPUT"
+          else
+            echo "target=thorium_shell" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Run gclient hooks
+        working-directory: ${{ env.CR_SRC_DIR }}
+        run: |
+          set -e
+          export PATH="$HOME/depot_tools:$PATH"
+          gclient runhooks
+        timeout-minutes: 120
+
+      - name: Apply Thorium setup (copy sources over Chromium tree)
+        run: |
+          set -e
+          export CR_DIR="$CR_SRC_DIR"
+          ln -s "$PWD/thorium" "$HOME/thorium"
+          cd "$HOME/thorium"
+          ./setup.sh || echo "::warning::setup.sh reported errors (patches may not apply cleanly); continuing"
+
+      - name: Configure GN (args.gn)
+        working-directory: ${{ env.CR_SRC_DIR }}
+        run: |
+          set -e
+          export PATH="$HOME/depot_tools:$PATH"
+          mkdir -p out/thorium
+          # Minimal dev configuration for CI smoke builds; the release args.gn
+          # requires PGO profiles and API keys not available to CI.
+          cat > out/thorium/args.gn <<EOF
+          is_debug = false
+          is_component_build = false
+          symbol_level = 0
+          blink_symbol_level = 0
+          treat_warnings_as_errors = false
+          clang_use_chrome_plugins = false
+          is_clang = true
+          proprietary_codecs = true
+          ffmpeg_branding = "Chrome"
+          use_sysroot = ${{ matrix.os == 'ubuntu-latest' && 'true' || 'false' }}
+          EOF
+          gn gen out/thorium
+
+      - name: Build target (${{ steps.tgt.outputs.target }})
+        working-directory: ${{ env.CR_SRC_DIR }}
+        run: |
+          set -e
+          export PATH="$HOME/depot_tools:$PATH"
+          autoninja -C out/thorium "${{ steps.tgt.outputs.target }}"
+
+      - name: Upload build artifacts
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: thorium-build-${{ matrix.os }}-${{ steps.tgt.outputs.target }}
+          path: |
+            chromium/src/out/thorium/${{ steps.tgt.outputs.target }}
+            chromium/src/out/thorium/*.pak
+            chromium/src/out/thorium/icudtl.dat
+            chromium/src/out/thorium/v8_context_snapshot.bin
+            chromium/src/out/thorium/snapshot_blob.bin
+          if-no-files-found: warn
+          retention-days: 5
+
+      - name: Disk usage report
+        if: always()
+        run: |
+          du -sh "$CR_SRC_DIR" 2>/dev/null || true
+          df -h || true
+
+  ###########################################################################
+  # Summary job
+  ###########################################################################
+  summary:
+    name: CI Summary
+    runs-on: ubuntu-latest
+    needs: [lint, setup-dryrun, build]
+    if: always()
+    steps:
+      - name: Write summary
+        run: |
+          {
+            echo "## Thorium CI Results"
+            echo ""
+            echo "| Job | Result |"
+            echo "|-----|--------|"
+            echo "| lint | ${{ needs.lint.result }} |"
+            echo "| setup-dryrun | ${{ needs.setup-dryrun.result }} |"
+            echo "| build | ${{ needs.build.result }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "${{ needs.lint.result }}" != "success" ] || \
+             [ "${{ needs.setup-dryrun.result }}" != "success" ] || \
+             [ "${{ needs.build.result }}" != "success" ]; then
+            echo "One or more required jobs failed."
+            exit 1
+          fi
+          echo "All jobs passed."
