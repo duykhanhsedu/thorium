@@ -11,6 +11,7 @@
 #include <map>
 #include <memory>
 #include <set>
+#include <vector>
 
 #include "base/files/file_util.h"
 #include "base/functional/bind.h"
@@ -47,25 +48,25 @@ ProcessMap GetProcesses() {
     Process process;
     process.pid = process_entry->pid();
     process.parent = process_entry->parent_pid();
-    map.insert(std::make_pair(process.pid, process));
+    map.try_emplace(process.pid, process);
   }
   return map;
 }
 
 // For each of a list of pids, collect memory information about that process.
-ProcessData GetProcessDataMemoryInformation(
-    const std::vector<pid_t>& pids) {
+ProcessData GetProcessDataMemoryInformation(const std::vector<pid_t>& pids) {
   ProcessData process_data;
+  process_data.processes.reserve(pids.size());
+
   for (pid_t pid : pids) {
     ProcessMemoryInformation pmi;
 
     pmi.pid = pid;
     pmi.num_processes = 1;
 
-    if (pmi.pid == base::GetCurrentProcId())
-      pmi.process_type = content::PROCESS_TYPE_BROWSER;
-    else
-      pmi.process_type = content::PROCESS_TYPE_UNKNOWN;
+    pmi.process_type = pid == base::GetCurrentProcId()
+                           ? content::PROCESS_TYPE_BROWSER
+                           : content::PROCESS_TYPE_UNKNOWN;
 
     std::unique_ptr<base::ProcessMetrics> metrics(
         base::ProcessMetrics::CreateProcessMetrics(pid));
@@ -82,10 +83,11 @@ std::vector<pid_t> GetAllChildren(const ProcessMap& processes, pid_t root) {
   std::vector<pid_t> children;
   children.push_back(root);
 
-  std::set<pid_t> wavefront, next_wavefront;
+  std::set<pid_t> wavefront;
   wavefront.insert(root);
 
-  while (wavefront.size()) {
+  while (!wavefront.empty()) {
+    std::set<pid_t> next_wavefront;
     for (const auto& entry : processes) {
       const Process& process = entry.second;
       if (wavefront.count(process.parent)) {
@@ -93,8 +95,6 @@ std::vector<pid_t> GetAllChildren(const ProcessMap& processes, pid_t root) {
         next_wavefront.insert(process.pid);
       }
     }
-
-    wavefront.clear();
     wavefront.swap(next_wavefront);
   }
   return children;
@@ -114,23 +114,26 @@ void MemoryDetails::CollectProcessData(
                                                 base::BlockingType::MAY_BLOCK);
 
   ProcessMap process_map = GetProcesses();
-  std::set<pid_t> browsers_found;
 
   ProcessData current_browser =
       GetProcessDataMemoryInformation(GetAllChildren(process_map, getpid()));
   current_browser.name = l10n_util::GetStringUTF16(IDS_SHORT_PRODUCT_NAME);
   current_browser.process_name = u"thorium";
 
-  for (auto i = current_browser.processes.begin();
-       i != current_browser.processes.end(); ++i) {
+  // Build a lookup of the child process info collected on the IO thread so
+  // that matching by pid is O(1) instead of a linear scan per process.
+  std::map<pid_t, const ProcessMemoryInformation&> child_info_by_pid;
+  for (const ProcessMemoryInformation& child : child_info) {
+    child_info_by_pid.emplace(child.pid, child);
+  }
+
+  for (ProcessMemoryInformation& process : current_browser.processes) {
     // Check if this is one of the child processes whose data we collected
     // on the IO thread, and if so copy over that data.
-    for (size_t child = 0; child < child_info.size(); child++) {
-      if (child_info[child].pid != i->pid)
-        continue;
-      i->titles = child_info[child].titles;
-      i->process_type = child_info[child].process_type;
-      break;
+    auto it = child_info_by_pid.find(process.pid);
+    if (it != child_info_by_pid.end()) {
+      process.titles = it->second.titles;
+      process.process_type = it->second.process_type;
     }
   }
 
